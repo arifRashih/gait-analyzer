@@ -91,6 +91,12 @@
   </details>
 </div>
 
+<div class="card" style="text-align:center; font-size:.9rem;">
+  Found this useful? Follow me on Instagram —
+  <a href="https://www.instagram.com/arifrashih" target="_blank" rel="noopener"
+     style="color:var(--accent); text-decoration:none; font-weight:600;">@arifrashih</a> 🏃
+</div>
+
 <div class="disclaimer">
   Screening tool only — 2D side-view analysis cannot assess hip drop, crossover, or pronation, and is not a substitute for clinical gait analysis.
   Flags describe patterns statistically associated with certain issues; they are not injury predictions or medical advice.
@@ -154,9 +160,49 @@ async function getLandmarker(variant) {
   });
 }
 
+/* Frame-stepped processing: seek to each frame and run detection, instead of
+   detecting off the playback clock. Playback-driven rVFC only fires for frames
+   the browser actually presents, so when inference is slower than the frame
+   interval it silently drops frames AND the set of processed frames depends on
+   device load — non-deterministic. Seeking processes every native frame exactly
+   once with identical results run-to-run. Slower than real time, but for a
+   validation tool correctness beats speed. */
+
+function seekTo(t) {
+  return new Promise(resolve => {
+    if (Math.abs(video.currentTime - t) < 1e-4) { resolve(); return; } // no seeked event if unchanged
+    const onSeeked = () => { video.removeEventListener("seeked", onSeeked); resolve(); };
+    video.addEventListener("seeked", onSeeked);
+    video.currentTime = t;
+  });
+}
+
+// Measure native frame rate with a short playback probe (no detection run here).
+function probeFps() {
+  return new Promise(resolve => {
+    let count = 0, firstT = null, lastT = null;
+    const cb = (now, meta) => {
+      if (firstT === null) firstT = meta.mediaTime;
+      lastT = meta.mediaTime; count++;
+      if (count >= 20 || meta.mediaTime - firstT > 1.0) {
+        video.pause();
+        const span = lastT - firstT;
+        const fps = span > 0 ? (count - 1) / span : 30;
+        resolve(Math.min(60, Math.max(24, Math.round(fps))));
+      } else {
+        video.requestVideoFrameCallback(cb);
+      }
+    };
+    video.currentTime = 0;
+    video.requestVideoFrameCallback(cb);
+    video.play().catch(()=>{});
+  });
+}
+
 $("analyzeBtn").addEventListener("click", async () => {
   $("analyzeBtn").disabled = true;
   frames = [];
+  finished = false;
   try {
     landmarker = await getLandmarker($("modelSel").value);
   } catch (err) {
@@ -173,27 +219,29 @@ $("analyzeBtn").addEventListener("click", async () => {
   }
   canvas.width = video.videoWidth; canvas.height = video.videoHeight;
   $("progressWrap").style.display = "block";
-  $("status").textContent = "Processing frames…";
-  video.currentTime = 0;
 
+  $("status").textContent = "Measuring frame rate…";
+  const fps = await probeFps();
+  const step = 1 / fps;
+
+  $("status").textContent = `Processing every frame at ${fps} fps (frame-stepped — takes longer than the clip, but exact)…`;
   framesSeen = 0; lastDetectError = null;
-  const onFrame = (now, meta) => {
-    const tMs = Math.round(meta.mediaTime * 1000);
+  video.pause();
+
+  for (let t = 0; t < video.duration; t += step) {
+    await seekTo(t);
     framesSeen++;
     let res;
-    try { res = landmarker.detectForVideo(video, tMs); }
+    try { res = landmarker.detectForVideo(video, Math.round(t * 1000)); }
     catch (err) { res = null; lastDetectError = err.message || String(err); }
     if (res && res.landmarks && res.landmarks.length) {
       const lms = res.landmarks[0].map(p => ({ x:p.x, y:p.y, v:p.visibility ?? 1 }));
-      frames.push({ t: meta.mediaTime, lms });
+      frames.push({ t, lms });
       drawSkeleton(lms);
     }
-    $("progressBar").style.width = (100 * meta.mediaTime / video.duration).toFixed(1) + "%";
-    if (!video.ended) video.requestVideoFrameCallback(onFrame);
-    else finishOnce();
-  };
-  video.requestVideoFrameCallback(onFrame);
-  video.play();
+    $("progressBar").style.width = (100 * t / video.duration).toFixed(1) + "%";
+  }
+  finishOnce();
 });
 
 let finished = false;
@@ -308,7 +356,19 @@ function finish() {
   }
 
   // metrics
-  const cadence = all.length / duration * 60;
+  // Cadence from the NEAR (better-tracked) leg's strikes x2, not the sum of both
+  // sides. In side view the far leg is often occluded, so summing L+R biases
+  // cadence low whenever far-side strikes drop out — and cadence is exactly the
+  // number cross-checked against COROS. Near side = leg with higher landmark
+  // visibility. Running cadence is near-symmetric, so one-foot rate x2 is robust.
+  const sideVis = (hip,knee,ank) => mean(frames.map(f => (f.lms[hip].v + f.lms[knee].v + f.lms[ank].v)/3));
+  const visLleg = sideVis(LM.L_HIP, LM.L_KNEE, LM.L_ANK);
+  const visRleg = sideVis(LM.R_HIP, LM.R_KNEE, LM.R_ANK);
+  const nearSide = visLleg >= visRleg ? "L" : "R";
+  const nearStrikes = nearSide === "L" ? L : R;
+  const cadence = nearStrikes.length >= 3
+    ? (nearStrikes.length / duration) * 60 * 2   // one-foot rate x2
+    : (all.length / duration) * 60;              // fallback if near side too sparse to trust
   const shankAvg = mean(all.map(e => e.shank));
   const footAheadAvg = mean(all.map(e => e.fwd));
 
@@ -334,7 +394,7 @@ function finish() {
 
   renderResults({ duration, vis, cadence, shankAvg, footAheadAvg, trunk, vosc, asym,
                   strikes: all, nL: L.length, nR: R.length });
-  $("status").textContent = `Done — ${frames.length} frames, ${all.length} footstrikes over ${duration.toFixed(1)}s.`;
+  $("status").textContent = `Done — ${frames.length} frames, ${all.length} footstrikes over ${duration.toFixed(1)}s. Cadence from ${nearSide==="L"?"left":"right"} (near) leg x2.`;
   $("analyzeBtn").disabled = false;
 }
 
