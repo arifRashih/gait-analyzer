@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Gait Analyzer — Prototype</title>
+<style>
+  :root{
+    --bg:#0d1117; --card:#161b22; --border:#30363d; --text:#e6edf3; --muted:#8b949e;
+    --green:#3fb950; --amber:#d29922; --red:#f85149; --accent:#58a6ff;
+  }
+  *{box-sizing:border-box; margin:0; padding:0;}
+  body{background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif; padding:20px; max-width:1100px; margin:0 auto;}
+  h1{font-size:1.4rem; margin-bottom:4px;}
+  .sub{color:var(--muted); font-size:.85rem; margin-bottom:20px;}
+  .card{background:var(--card); border:1px solid var(--border); border-radius:10px; padding:16px; margin-bottom:16px;}
+  .protocol{font-size:.85rem; color:var(--muted); line-height:1.5;}
+  .protocol strong{color:var(--text);}
+  .row{display:flex; gap:12px; flex-wrap:wrap; align-items:center;}
+  input[type=file]{color:var(--muted); font-size:.85rem;}
+  select,button{background:#21262d; color:var(--text); border:1px solid var(--border); border-radius:6px; padding:8px 14px; font-size:.9rem; cursor:pointer;}
+  button.primary{background:#238636; border-color:#2ea043;}
+  button:disabled{opacity:.4; cursor:not-allowed;}
+  #stage{position:relative; width:100%; background:#000; border-radius:10px; overflow:hidden; display:none;}
+  #video{width:100%; display:block;}
+  #overlay{position:absolute; top:0; left:0; width:100%; height:100%; pointer-events:none;}
+  #progressWrap{height:6px; background:var(--border); border-radius:3px; margin-top:10px; overflow:hidden; display:none;}
+  #progressBar{height:100%; width:0%; background:var(--accent); transition:width .2s;}
+  #status{font-size:.85rem; color:var(--muted); margin-top:8px;}
+  .metrics{display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:12px;}
+  .metric{background:var(--card); border:1px solid var(--border); border-left:4px solid var(--muted); border-radius:8px; padding:14px;}
+  .metric.green{border-left-color:var(--green);}
+  .metric.amber{border-left-color:var(--amber);}
+  .metric.red{border-left-color:var(--red);}
+  .metric .name{font-size:.75rem; text-transform:uppercase; letter-spacing:.05em; color:var(--muted);}
+  .metric .value{font-size:1.6rem; font-weight:700; margin:4px 0;}
+  .metric .flag{font-size:.8rem; line-height:1.4; color:var(--muted);}
+  .warn{background:#3d2e00; border:1px solid var(--amber); color:#e3b341; padding:10px 14px; border-radius:8px; font-size:.85rem; margin-bottom:16px; display:none;}
+  details{margin-top:10px; font-size:.8rem; color:var(--muted);}
+  summary{cursor:pointer;}
+  table{width:100%; border-collapse:collapse; margin-top:8px; font-size:.78rem;}
+  th,td{padding:4px 8px; text-align:right; border-bottom:1px solid var(--border);}
+  th:first-child,td:first-child{text-align:left;}
+  .disclaimer{font-size:.75rem; color:var(--muted); margin-top:20px; line-height:1.5;}
+</style>
+</head>
+<body>
+
+<h1>🏃 Gait Analyzer <span style="color:var(--muted);font-weight:400;">prototype</span></h1>
+<div class="sub">Side-view running video → pose estimation → metrics + flags. Everything runs in your browser; the video never leaves your device.</div>
+
+<div class="card protocol">
+  <strong>Recording protocol (accuracy depends on this):</strong>
+  treadmill preferred · phone on stable surface, side-on, lens at hip height, 3–5 m away ·
+  whole body in frame, feet never cropped · 60 fps if possible · 15–30 s steady pace ·
+  good lighting, fitted clothing.
+</div>
+
+<div class="card">
+  <div class="row">
+    <input type="file" id="fileInput" accept="video/*">
+    <select id="modelSel" title="Model accuracy vs speed">
+      <option value="lite">Model: Lite (fast)</option>
+      <option value="full" selected>Model: Full (balanced)</option>
+      <option value="heavy">Model: Heavy (accurate, slow)</option>
+    </select>
+    <button class="primary" id="analyzeBtn" disabled>Analyze</button>
+  </div>
+  <div id="progressWrap"><div id="progressBar"></div></div>
+  <div id="status">Load a video to begin. Pose model downloads on first run (~10 MB, needs internet once).</div>
+</div>
+
+<div class="warn" id="qualityWarn"></div>
+
+<div id="stage" class="card" style="padding:0;">
+  <video id="video" muted playsinline></video>
+  <canvas id="overlay"></canvas>
+</div>
+
+<div class="metrics" id="metrics"></div>
+
+<div class="card" id="commentCard" style="display:none;">
+  <div style="font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:8px;">Gait commentary</div>
+  <div id="commentBody" style="font-size:.92rem;line-height:1.6;"></div>
+</div>
+
+<div class="card" id="detailCard" style="display:none;">
+  <details>
+    <summary>Per-footstrike detail</summary>
+    <table id="strikeTable"></table>
+  </details>
+</div>
+
+<div class="disclaimer">
+  Screening tool only — 2D side-view analysis cannot assess hip drop, crossover, or pronation, and is not a substitute for clinical gait analysis.
+  Flags describe patterns statistically associated with certain issues; they are not injury predictions or medical advice.
+  Thresholds are editable in the CONFIG object in this file.
+</div>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+/* ============ CONFIG — tune thresholds here ============ */
+const CONFIG = {
+  minVisibility: 0.5,          // avg landmark visibility below this → warn
+  minStrikeGapSec: 0.38,       // min time between same-foot strikes
+  maxClipSec: 45,
+  cadence:   { low: 170, ok: 180 },              // spm
+  shank:     { flag: 10 },                       // ° ahead of vertical at footstrike
+  footAhead: { flag: 0.25 },                     // ankle ahead of hip, × leg length
+  trunk:     { upright: 2, typicalHi: 8, excess: 12 }, // ° forward lean
+  vosc:      { flag: 8 },                        // % of leg length
+  asym:      { flag: 5 }                         // % L/R stance-count imbalance proxy
+};
+/* ======================================================= */
+
+const LM = { NOSE:0, L_SHO:11, R_SHO:12, L_HIP:23, R_HIP:24, L_KNEE:25, R_KNEE:26,
+             L_ANK:27, R_ANK:28, L_HEEL:29, R_HEEL:30, L_TOE:31, R_TOE:32 };
+
+const $ = id => document.getElementById(id);
+const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
+let landmarker = null, frames = [], fileURL = null, framesSeen = 0, lastDetectError = null;
+
+if (!("requestVideoFrameCallback" in HTMLVideoElement.prototype)) {
+  $("status") && ($("status").textContent = "This browser doesn't support frame-by-frame video processing. Use Chrome, Edge, or Safari.");
+}
+
+$("fileInput").addEventListener("change", e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  if (fileURL) URL.revokeObjectURL(fileURL);
+  fileURL = URL.createObjectURL(f);
+  video.src = fileURL;
+  $("stage").style.display = "block";
+  $("analyzeBtn").disabled = false;
+  $("metrics").innerHTML = "";
+  $("detailCard").style.display = "none";
+  $("commentCard").style.display = "none";
+  $("qualityWarn").style.display = "none";
+  $("status").textContent = "Video loaded. Press Analyze.";
+});
+
+async function getLandmarker(variant) {
+  $("status").textContent = "Loading pose model…";
+  const files = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm");
+  return PoseLandmarker.createFromOptions(files, {
+    baseOptions: {
+      modelAssetPath: `https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_${variant}/float16/1/pose_landmarker_${variant}.task`,
+      delegate: "GPU"
+    },
+    runningMode: "VIDEO",
+    numPoses: 1
+  });
+}
+
+$("analyzeBtn").addEventListener("click", async () => {
+  $("analyzeBtn").disabled = true;
+  frames = [];
+  try {
+    landmarker = await getLandmarker($("modelSel").value);
+  } catch (err) {
+    $("status").textContent = "Model load failed (check internet): " + err.message;
+    $("analyzeBtn").disabled = false;
+    return;
+  }
+  await video.play().catch(()=>{});
+  video.pause();
+  if (video.duration > CONFIG.maxClipSec) {
+    $("status").textContent = `Clip is ${video.duration.toFixed(0)}s — max ${CONFIG.maxClipSec}s. Trim it first.`;
+    $("analyzeBtn").disabled = false;
+    return;
+  }
+  canvas.width = video.videoWidth; canvas.height = video.videoHeight;
+  $("progressWrap").style.display = "block";
+  $("status").textContent = "Processing frames…";
+  video.currentTime = 0;
+
+  framesSeen = 0; lastDetectError = null;
+  const onFrame = (now, meta) => {
+    const tMs = Math.round(meta.mediaTime * 1000);
+    framesSeen++;
+    let res;
+    try { res = landmarker.detectForVideo(video, tMs); }
+    catch (err) { res = null; lastDetectError = err.message || String(err); }
+    if (res && res.landmarks && res.landmarks.length) {
+      const lms = res.landmarks[0].map(p => ({ x:p.x, y:p.y, v:p.visibility ?? 1 }));
+      frames.push({ t: meta.mediaTime, lms });
+      drawSkeleton(lms);
+    }
+    $("progressBar").style.width = (100 * meta.mediaTime / video.duration).toFixed(1) + "%";
+    if (!video.ended) video.requestVideoFrameCallback(onFrame);
+    else finishOnce();
+  };
+  video.requestVideoFrameCallback(onFrame);
+  video.play();
+});
+
+let finished = false;
+function finishOnce(){ if (!finished) { finished = true; finish(); } }
+video.addEventListener("ended", () => setTimeout(finishOnce, 150));
+$("fileInput").addEventListener("change", () => { finished = false; });
+
+const BONES = [[11,12],[11,23],[12,24],[23,24],[23,25],[25,27],[27,29],[27,31],[29,31],
+               [24,26],[26,28],[28,30],[28,32],[30,32],[11,13],[12,14]];
+function drawSkeleton(lms) {
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  ctx.strokeStyle = "#58a6ff"; ctx.lineWidth = 3; ctx.fillStyle = "#3fb950";
+  const W = canvas.width, H = canvas.height;
+  for (const [a,b] of BONES) {
+    if (!lms[a] || !lms[b]) continue;
+    ctx.beginPath(); ctx.moveTo(lms[a].x*W, lms[a].y*H); ctx.lineTo(lms[b].x*W, lms[b].y*H); ctx.stroke();
+  }
+  for (const p of lms) { ctx.beginPath(); ctx.arc(p.x*W, p.y*H, 4, 0, 7); ctx.fill(); }
+}
+
+/* ---------------- analysis ---------------- */
+
+function px(p) { return { x: p.x * canvas.width, y: p.y * canvas.height }; }
+function dist(a,b){ return Math.hypot(a.x-b.x, a.y-b.y); }
+function mean(arr){ return arr.length ? arr.reduce((s,v)=>s+v,0)/arr.length : NaN; }
+function smooth(arr, w=5) {
+  const out = [];
+  for (let i=0;i<arr.length;i++){
+    let s=0,n=0;
+    for (let j=Math.max(0,i-w); j<=Math.min(arr.length-1,i+w); j++){ s+=arr[j]; n++; }
+    out.push(s/n);
+  }
+  return out;
+}
+
+function finish() {
+  $("progressBar").style.width = "100%";
+  if (frames.length < 30) {
+    let msg;
+    if (framesSeen < 10) {
+      msg = `The video barely played (${framesSeen} frames seen). Possible codec/browser issue — try Chrome, or re-export the video as standard MP4 (H.264).`;
+    } else if (lastDetectError) {
+      msg = `Video played (${framesSeen} frames) but the pose model errored: "${lastDetectError}". Try the Lite model, or a different browser.`;
+    } else if (frames.length === 0) {
+      msg = `Video played (${framesSeen} frames) but no person was detected in any frame. Check: whole body visible? Person large enough in frame (3–5 m away, not 15)? Enough light?`;
+    } else {
+      msg = `Pose detected in only ${frames.length} of ${framesSeen} frames — tracking is dropping out. Usual causes: feet/head cropped, backlighting, motion blur, or loose clothing. Re-record following the protocol above.`;
+    }
+    $("status").textContent = msg;
+    $("analyzeBtn").disabled = false;
+    return;
+  }
+  const duration = frames[frames.length-1].t - frames[0].t;
+
+  // quality gate: mean visibility of hips/knees/ankles
+  const keyIds = [LM.L_HIP,LM.R_HIP,LM.L_KNEE,LM.R_KNEE,LM.L_ANK,LM.R_ANK];
+  const vis = mean(frames.map(f => mean(keyIds.map(i => f.lms[i].v))));
+  if (vis < CONFIG.minVisibility) {
+    $("qualityWarn").style.display = "block";
+    $("qualityWarn").textContent = `⚠ Low landmark confidence (${(vis*100).toFixed(0)}%). Results below are unreliable — re-record following the protocol.`;
+  }
+
+  // running direction: which way the feet point (toe ahead of heel)
+  const dirVals = frames.map(f =>
+    (f.lms[LM.L_TOE].x - f.lms[LM.L_HEEL].x) + (f.lms[LM.R_TOE].x - f.lms[LM.R_HEEL].x));
+  const dir = Math.sign(mean(dirVals)) || 1;
+
+  // leg length in px (hip→knee + knee→ankle, both sides averaged)
+  const legLen = mean(frames.map(f => {
+    const l = dist(px(f.lms[LM.L_HIP]),px(f.lms[LM.L_KNEE])) + dist(px(f.lms[LM.L_KNEE]),px(f.lms[LM.L_ANK]));
+    const r = dist(px(f.lms[LM.R_HIP]),px(f.lms[LM.R_KNEE])) + dist(px(f.lms[LM.R_KNEE]),px(f.lms[LM.R_ANK]));
+    return (l+r)/2;
+  }));
+
+  const hipMidX = frames.map(f => (f.lms[LM.L_HIP].x + f.lms[LM.R_HIP].x)/2 * canvas.width);
+  const hipMidY = frames.map(f => (f.lms[LM.L_HIP].y + f.lms[LM.R_HIP].y)/2 * canvas.height);
+  const times = frames.map(f => f.t);
+
+  // footstrike detection: peaks of forward ankle displacement relative to hip
+  function strikesFor(ankleId, kneeId) {
+    const fwd = smooth(frames.map((f,i) => (f.lms[ankleId].x*canvas.width - hipMidX[i]) * dir / legLen), 2);
+    const ankY = smooth(frames.map(f => f.lms[ankleId].y * canvas.height), 2);
+    const yThresh = [...ankY].sort((a,b)=>a-b)[Math.floor(ankY.length*0.55)]; // near-ground check
+    const events = [];
+    for (let i=2; i<fwd.length-2; i++) {
+      if (fwd[i] >= fwd[i-1] && fwd[i] >= fwd[i+1] && fwd[i] > fwd[i-2] && fwd[i] > fwd[i+2]) {
+        if (ankY[i] < yThresh) continue; // ankle high = swing, not a strike
+        if (events.length && times[i] - events[events.length-1].t < CONFIG.minStrikeGapSec) {
+          if (fwd[i] > events[events.length-1].fwd) events[events.length-1] = mk(i);
+          continue;
+        }
+        events.push(mk(i));
+      }
+      function mk(i){
+        const f = frames[i];
+        const knee = px(f.lms[kneeId]), ank = px(f.lms[ankleId]);
+        // shank angle vs vertical, positive = ankle ahead of knee (overstride direction)
+        const shank = Math.atan2((ank.x-knee.x)*dir, ank.y-knee.y) * 180/Math.PI;
+        return { i, t: times[i], fwd: fwd[i], shank };
+      }
+    }
+    return events;
+  }
+  const L = strikesFor(LM.L_ANK, LM.L_KNEE);
+  const R = strikesFor(LM.R_ANK, LM.R_KNEE);
+  const all = [...L.map(e=>({...e,side:"L"})), ...R.map(e=>({...e,side:"R"}))].sort((a,b)=>a.t-b.t);
+
+  if (all.length < 6) {
+    $("status").textContent = `Only ${all.length} footstrikes detected — clip too short or tracking failed.`;
+    $("analyzeBtn").disabled = false;
+    return;
+  }
+
+  // metrics
+  const cadence = all.length / duration * 60;
+  const shankAvg = mean(all.map(e => e.shank));
+  const footAheadAvg = mean(all.map(e => e.fwd));
+
+  const trunk = mean(frames.map(f => {
+    const sh = { x:(f.lms[LM.L_SHO].x+f.lms[LM.R_SHO].x)/2*canvas.width, y:(f.lms[LM.L_SHO].y+f.lms[LM.R_SHO].y)/2*canvas.height };
+    const hp = { x:(f.lms[LM.L_HIP].x+f.lms[LM.R_HIP].x)/2*canvas.width, y:(f.lms[LM.L_HIP].y+f.lms[LM.R_HIP].y)/2*canvas.height };
+    return Math.atan2((sh.x-hp.x)*dir, hp.y-sh.y) * 180/Math.PI; // + = forward lean
+  }));
+
+  // vertical oscillation: hip-mid amplitude per stride (same-foot strike to strike)
+  const strideAmps = [];
+  const bySide = { L, R };
+  for (const side of ["L","R"]) {
+    const ev = bySide[side];
+    for (let k=0; k<ev.length-1; k++) {
+      const seg = hipMidY.slice(ev[k].i, ev[k+1].i+1);
+      if (seg.length > 3) strideAmps.push((Math.max(...seg) - Math.min(...seg)) / legLen * 100);
+    }
+  }
+  const vosc = mean(strideAmps);
+
+  const asym = Math.abs(L.length - R.length) / Math.max(L.length, R.length) * 100;
+
+  renderResults({ duration, vis, cadence, shankAvg, footAheadAvg, trunk, vosc, asym,
+                  strikes: all, nL: L.length, nR: R.length });
+  $("status").textContent = `Done — ${frames.length} frames, ${all.length} footstrikes over ${duration.toFixed(1)}s.`;
+  $("analyzeBtn").disabled = false;
+}
+
+/* ---------------- rendering ---------------- */
+
+function metricCard(name, value, unit, level, flag) {
+  return `<div class="metric ${level}">
+    <div class="name">${name}</div>
+    <div class="value">${value}<span style="font-size:.9rem;color:var(--muted);"> ${unit}</span></div>
+    <div class="flag">${flag}</div></div>`;
+}
+
+function renderResults(m) {
+  const C = CONFIG;
+  let html = "";
+
+  let lv = m.cadence >= C.cadence.ok ? "green" : m.cadence >= C.cadence.low ? "amber" : "red";
+  html += metricCard("Cadence", m.cadence.toFixed(0), "spm", lv,
+    lv==="green" ? "In the range generally seen in efficient runners." :
+    lv==="amber" ? "Acceptable. Note cadence is pace-dependent — compare at similar paces." :
+    "Low — often associated with overstriding and higher braking forces.");
+
+  lv = m.shankAvg > C.shank.flag ? "red" : m.shankAvg > C.shank.flag*0.7 ? "amber" : "green";
+  html += metricCard("Shank angle at footstrike", m.shankAvg.toFixed(1), "°", lv,
+    lv==="green" ? "Shank near vertical at contact — foot landing under the body." :
+    "Shank inclined forward at contact — pattern associated with overstriding/braking.");
+
+  lv = m.footAheadAvg > C.footAhead.flag ? "red" : m.footAheadAvg > C.footAhead.flag*0.8 ? "amber" : "green";
+  html += metricCard("Foot ahead of hip", (m.footAheadAvg*100).toFixed(0), "% leg length", lv,
+    lv==="green" ? "Foot lands close to under the hips." :
+    "Foot landing well ahead of the hips — corroborates the overstride signal.");
+
+  lv = m.trunk > C.trunk.excess ? "red" : (m.trunk < C.trunk.upright || m.trunk > C.trunk.typicalHi) ? "amber" : "green";
+  html += metricCard("Trunk lean", m.trunk.toFixed(1), "° fwd", lv,
+    m.trunk > C.trunk.excess ? "Marked forward lean — sometimes linked to limited hip extension or fatigue." :
+    m.trunk < C.trunk.upright ? "Very upright — a slight forward lean from the ankles is typical." :
+    m.trunk > C.trunk.typicalHi ? "Slightly more lean than typical." : "Within the typical range.");
+
+  lv = m.vosc > C.vosc.flag ? "amber" : "green";
+  html += metricCard("Vertical oscillation", isNaN(m.vosc) ? "–" : m.vosc.toFixed(1), "% leg length", lv,
+    lv==="green" ? "Vertical movement in a normal range." :
+    "Relatively bouncy — vertical displacement is energy not moving you forward.");
+
+  lv = m.asym > C.asym.flag ? "amber" : "green";
+  html += metricCard("L/R strike balance", `${m.nL} / ${m.nR}`, "strikes", lv,
+    lv==="green" ? "Detected strikes are balanced between sides." :
+    "Imbalance in detected strikes — could be tracking artefact (far side is often occluded) or true asymmetry. Interpret cautiously.");
+
+  $("metrics").innerHTML = html;
+
+  let rows = "<tr><th>#</th><th>Side</th><th>t (s)</th><th>Shank ° </th><th>Foot ahead (%LL)</th></tr>";
+  m.strikes.forEach((e,i) => {
+    rows += `<tr><td>${i+1}</td><td>${e.side}</td><td>${e.t.toFixed(2)}</td><td>${e.shank.toFixed(1)}</td><td>${(e.fwd*100).toFixed(0)}</td></tr>`;
+  });
+  $("strikeTable").innerHTML = rows;
+  $("detailCard").style.display = "block";
+
+  $("commentBody").innerHTML = buildCommentary(m);
+  $("commentCard").style.display = "block";
+}
+
+/* ---------------- rule-based gait commentary ---------------- */
+
+function buildCommentary(m) {
+  const C = CONFIG;
+  const paras = [], focus = [];
+
+  const shankFlag = m.shankAvg > C.shank.flag;
+  const shankMild = !shankFlag && m.shankAvg > C.shank.flag * 0.7;
+  const footFlag  = m.footAheadAvg > C.footAhead.flag;
+  const cadLow    = m.cadence < C.cadence.low;
+  const cadMid    = !cadLow && m.cadence < C.cadence.ok;
+
+  // 1. Dominant pattern: overstriding story
+  if (shankFlag && footFlag) {
+    let s = `The clearest pattern in this clip is <strong>overstriding</strong>: the foot lands about ${(m.footAheadAvg*100).toFixed(0)}% of leg length ahead of the hips with the shank inclined ${m.shankAvg.toFixed(0)}° forward at contact. Both signals point the same way, so this is unlikely to be a tracking artefact.`;
+    if (cadLow) s += ` The low cadence (${m.cadence.toFixed(0)} spm) fits the same picture — longer, slower steps usually mean the foot reaches further out in front.`;
+    paras.push(s);
+    focus.push(`Raising cadence ~5% at the same pace (target ≈ ${(m.cadence*1.05).toFixed(0)} spm) is the most common first step runners use to reduce overstriding — shorter steps naturally land closer under the hips.`);
+  } else if (shankFlag || footFlag || shankMild) {
+    paras.push(`There's a <strong>mild overstride signal</strong>: ${shankFlag||shankMild ? `shank angle at contact averages ${m.shankAvg.toFixed(1)}°` : `the foot lands ${(m.footAheadAvg*100).toFixed(0)}% of leg length ahead of the hips`}, but the corroborating signal is within normal range. Worth re-checking on a second clip before reading much into it.`);
+    if (cadLow) focus.push(`Cadence is on the low side (${m.cadence.toFixed(0)} spm); if the overstride signal repeats on another clip, a small cadence increase is the usual lever.`);
+  } else if (cadLow) {
+    paras.push(`Foot placement looks good — landing close to under the hips with a near-vertical shank — but <strong>cadence is low</strong> at ${m.cadence.toFixed(0)} spm. Since the landing position is clean, the low cadence here may simply reflect an easy pace rather than a form issue. Compare against a clip at your normal training pace.`);
+  } else {
+    paras.push(`<strong>Foot placement and cadence both look sound</strong>: landing close to under the hips (${(m.footAheadAvg*100).toFixed(0)}% leg length, shank ${m.shankAvg.toFixed(1)}°) at ${m.cadence.toFixed(0)} spm.`);
+  }
+
+  // 2. Trunk
+  if (m.trunk > C.trunk.excess) {
+    paras.push(`Trunk lean is <strong>marked</strong> at ${m.trunk.toFixed(0)}° forward. A strong forward lean sometimes reflects limited hip extension or fatigue — it's worth checking whether this appears early in a run or only late.`);
+    focus.push(`If the forward lean shows up when fresh, hip-flexor mobility and glute/hip-extension strength are the usual areas to look at.`);
+  } else if (m.trunk < C.trunk.upright) {
+    paras.push(`Posture is <strong>very upright</strong> (${m.trunk.toFixed(1)}°). A slight whole-body lean from the ankles is typical; a fully vertical trunk sometimes accompanies heel-first reaching, though your landing metrics ${shankFlag||footFlag ? "do show that pattern" : "don't show that here"}.`);
+  }
+
+  // 3. Bounce
+  if (m.vosc > C.vosc.flag) {
+    paras.push(`Vertical oscillation is on the <strong>bouncy</strong> side (${m.vosc.toFixed(1)}% of leg length) — some of your effort is going up rather than forward. This often improves on its own if cadence comes up.`);
+  }
+
+  // 4. Asymmetry
+  if (m.asym > C.asym.flag) {
+    paras.push(`Detected footstrikes are <strong>uneven between sides</strong> (${m.nL} left / ${m.nR} right). On side-view video the far leg is partly occluded, so this is as likely a tracking artefact as a true asymmetry — but if you're returning from injury, it's worth a rear-view clip to check properly.`);
+  }
+
+  // 5. Overall verdict + focus list
+  const flags = [shankFlag&&footFlag, m.trunk>C.trunk.excess, m.vosc>C.vosc.flag].filter(Boolean).length;
+  if (flags === 0 && !cadLow) {
+    paras.push(`Overall: nothing in this clip stands out as a priority to change. The most useful next step is repeating this recording periodically (or when fatigued / post-injury) and watching for drift.`);
+  } else if (focus.length) {
+    paras.push(`<strong>Suggested focus (max one change at a time):</strong><br>` +
+      focus.slice(0,2).map((f,i)=>`${i+1}. ${f}`).join("<br>"));
+  }
+
+  paras.push(`<span style="color:var(--muted);font-size:.8rem;">Commentary is generated from the metrics above using fixed rules. It describes patterns, not diagnoses — form changes are best made gradually and one at a time, ideally with a coach or physio if there's pain involved.</span>`);
+
+  if (m.vis < CONFIG.minVisibility) {
+    paras.unshift(`<span style="color:var(--amber);">⚠ Landmark confidence was low on this clip, so treat everything below as provisional.</span>`);
+  }
+
+  return paras.map(p => `<p style="margin-bottom:10px;">${p}</p>`).join("");
+}
+</script>
+</body>
+</html>
