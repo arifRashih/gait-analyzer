@@ -163,9 +163,9 @@ async function getLandmarker(variant) {
 /* Frame-stepped processing: seek to each frame and run detection, instead of
    detecting off the playback clock. Playback-driven rVFC only fires for frames
    the browser actually presents, so when inference is slower than the frame
-   interval it silently drops frames AND the set of processed frames depends on
-   device load — non-deterministic. Seeking processes every native frame exactly
-   once with identical results run-to-run. Slower than real time, but for a
+   interval it silently drops frames AND the processed set depends on device
+   load — non-deterministic. Seeking processes every native frame exactly once
+   with identical results run-to-run. Slower than real time, but for a
    validation tool correctness beats speed. */
 
 function seekTo(t) {
@@ -177,7 +177,7 @@ function seekTo(t) {
   });
 }
 
-// Measure native frame rate with a short playback probe (no detection run here).
+// Measure native frame rate with a short playback probe (no detection here).
 function probeFps() {
   return new Promise(resolve => {
     let count = 0, firstT = null, lastT = null;
@@ -277,6 +277,61 @@ function smooth(arr, w=5) {
   return out;
 }
 
+/* Resample an irregular (t,val) series onto a uniform grid via linear interp.
+   Frame-stepping samples uniformly, but detection dropouts can leave gaps; this
+   keeps autocorrelation well-defined regardless. */
+function resampleUniform(times, vals) {
+  const n = times.length;
+  const span = times[n-1] - times[0];
+  const dt = span / (n - 1);
+  const N = Math.max(4, Math.round(span / dt) + 1);
+  const out = new Array(N);
+  let j = 0;
+  for (let k = 0; k < N; k++) {
+    const tk = times[0] + k * dt;
+    while (j < n - 2 && times[j+1] < tk) j++;
+    const t0 = times[j], t1 = times[j+1];
+    const a = (t1 > t0) ? (tk - t0) / (t1 - t0) : 0;
+    out[k] = vals[j] * (1 - a) + vals[j+1] * a;
+  }
+  return { grid: out, dt };
+}
+
+/* Fundamental period of a near-periodic signal via normalised autocorrelation,
+   searched only within [minPeriodSec, maxPeriodSec]. Detrended first (subtract a
+   long moving average) to strip slow camera/treadmill drift while preserving the
+   gait band. Returns { periodSec, strength } or null; strength is the normalised
+   AC peak height in [0,1] — a rough confidence. */
+function autocorrPeriod(times, vals, minPeriodSec, maxPeriodSec) {
+  if (times.length < 8) return null;
+  const { grid, dt } = resampleUniform(times, vals);
+  const n = grid.length;
+  const hw = Math.max(3, Math.round(0.8 / dt));   // ~1.6s window: slower than any gait period
+  const base = smooth(grid, hw);
+  const y = grid.map((v,i) => v - base[i]);
+  let r0 = 0; for (let i=0;i<n;i++) r0 += y[i]*y[i];
+  if (r0 <= 1e-9) return null;
+  const minLag = Math.max(1, Math.floor(minPeriodSec / dt));
+  const maxLag = Math.min(n - 2, Math.ceil(maxPeriodSec / dt));
+  if (maxLag <= minLag) return null;
+  const r = {};
+  let best = { lag: -1, val: -Infinity };
+  for (let lag = minLag; lag <= maxLag; lag++) {
+    let s = 0;
+    for (let i = 0; i + lag < n; i++) s += y[i] * y[i+lag];
+    r[lag] = s / r0;
+    if (r[lag] > best.val) best = { lag, val: r[lag] };
+  }
+  if (best.lag < 0) return null;
+  let refined = best.lag;                         // parabolic interp for sub-frame period
+  const rm = r[best.lag-1], rc = r[best.lag], rp = r[best.lag+1];
+  if (rm !== undefined && rp !== undefined) {
+    const denom = rm - 2*rc + rp;
+    if (denom !== 0) refined = best.lag + 0.5 * (rm - rp) / denom;
+  }
+  return { periodSec: refined * dt, strength: Math.max(0, best.val) };
+}
+
 function finish() {
   $("progressBar").style.width = "100%";
   if (frames.length < 30) {
@@ -356,19 +411,34 @@ function finish() {
   }
 
   // metrics
-  // Cadence from the NEAR (better-tracked) leg's strikes x2, not the sum of both
-  // sides. In side view the far leg is often occluded, so summing L+R biases
-  // cadence low whenever far-side strikes drop out — and cadence is exactly the
-  // number cross-checked against COROS. Near side = leg with higher landmark
-  // visibility. Running cadence is near-symmetric, so one-foot rate x2 is robust.
+  // near side (better-tracked leg) by landmark visibility — used for the
+  // frequency estimate and the event-count cross-check
   const sideVis = (hip,knee,ank) => mean(frames.map(f => (f.lms[hip].v + f.lms[knee].v + f.lms[ank].v)/3));
-  const visLleg = sideVis(LM.L_HIP, LM.L_KNEE, LM.L_ANK);
-  const visRleg = sideVis(LM.R_HIP, LM.R_KNEE, LM.R_ANK);
-  const nearSide = visLleg >= visRleg ? "L" : "R";
+  const nearSide = sideVis(LM.L_HIP,LM.L_KNEE,LM.L_ANK) >= sideVis(LM.R_HIP,LM.R_KNEE,LM.R_ANK) ? "L" : "R";
   const nearStrikes = nearSide === "L" ? L : R;
-  const cadence = nearStrikes.length >= 3
-    ? (nearStrikes.length / duration) * 60 * 2   // one-foot rate x2
-    : (all.length / duration) * 60;              // fallback if near side too sparse to trust
+
+  // PRIMARY cadence = frequency of the gait rhythm (autocorrelation), NOT a strike
+  // count — so missed footfalls and far-leg occlusion cannot bias it. Near-ankle
+  // vertical cycles once per STRIDE; hip-mid vertical once per STEP.
+  const nearAnkId = nearSide === "L" ? LM.L_ANK : LM.R_ANK;
+  const ankYser = frames.map(f => f.lms[nearAnkId].y * canvas.height);
+  const ankAC = autocorrPeriod(times, ankYser, 0.50, 1.10);   // stride-period band
+  const hipAC = autocorrPeriod(times, hipMidY, 0.28, 0.55);   // step-period band
+  const cadAnkle = ankAC ? 120 / ankAC.periodSec : NaN;       // (1/stride)*2*60
+  const cadHip   = hipAC ?  60 / hipAC.periodSec : NaN;       // (1/step)*60
+  const cadEvent = nearStrikes.length >= 3
+    ? (nearStrikes.length / duration) * 60 * 2
+    : (all.length / duration) * 60;
+
+  let cadence, cadSource;
+  if (!isNaN(cadAnkle) && ankAC.strength > 0.25)      { cadence = cadAnkle; cadSource = "ankle rhythm"; }
+  else if (!isNaN(cadHip) && hipAC.strength > 0.20)   { cadence = cadHip;   cadSource = "hip rhythm"; }
+  else                                                { cadence = cadEvent; cadSource = "strike count"; }
+
+  // cross-method agreement → confidence, and a direct read on missed strikes
+  const cadEst = [cadAnkle, cadHip, cadEvent].filter(v => !isNaN(v) && v > 0);
+  const cadSpread = cadEst.length > 1
+    ? (Math.max(...cadEst) - Math.min(...cadEst)) / mean(cadEst) * 100 : NaN;
   const shankAvg = mean(all.map(e => e.shank));
   const footAheadAvg = mean(all.map(e => e.fwd));
 
@@ -392,9 +462,10 @@ function finish() {
 
   const asym = Math.abs(L.length - R.length) / Math.max(L.length, R.length) * 100;
 
-  renderResults({ duration, vis, cadence, shankAvg, footAheadAvg, trunk, vosc, asym,
+  renderResults({ duration, vis, cadence, cadAnkle, cadHip, cadEvent, cadSpread, cadSource,
+                  shankAvg, footAheadAvg, trunk, vosc, asym,
                   strikes: all, nL: L.length, nR: R.length });
-  $("status").textContent = `Done — ${frames.length} frames, ${all.length} footstrikes over ${duration.toFixed(1)}s. Cadence from ${nearSide==="L"?"left":"right"} (near) leg x2.`;
+  $("status").textContent = `Done — ${frames.length} frames, ${all.length} footstrikes over ${duration.toFixed(1)}s. Cadence via ${cadSource}.`;
   $("analyzeBtn").disabled = false;
 }
 
@@ -412,10 +483,21 @@ function renderResults(m) {
   let html = "";
 
   let lv = m.cadence >= C.cadence.ok ? "green" : m.cadence >= C.cadence.low ? "amber" : "red";
-  html += metricCard("Cadence", m.cadence.toFixed(0), "spm", lv,
-    lv==="green" ? "In the range generally seen in efficient runners." :
-    lv==="amber" ? "Acceptable. Note cadence is pace-dependent — compare at similar paces." :
-    "Low — often associated with overstriding and higher braking forces.");
+  {
+    const est = [];
+    if (!isNaN(m.cadAnkle)) est.push(`ankle ${m.cadAnkle.toFixed(0)}`);
+    if (!isNaN(m.cadHip))   est.push(`hip ${m.cadHip.toFixed(0)}`);
+    if (!isNaN(m.cadEvent)) est.push(`strikes ${m.cadEvent.toFixed(0)}`);
+    const agree = isNaN(m.cadSpread) ? "" :
+      m.cadSpread < 6
+        ? ` Methods agree (±${m.cadSpread.toFixed(0)}%) — high confidence.`
+        : ` Methods differ (±${m.cadSpread.toFixed(0)}%): the strike detector is probably missing footfalls — trust the rhythm value, not the count.`;
+    const base = lv==="green" ? "In the range generally seen in efficient runners." :
+      lv==="amber" ? "Acceptable. Note cadence is pace-dependent — compare at similar paces." :
+      "Low — often associated with overstriding and higher braking forces.";
+    html += metricCard("Cadence", m.cadence.toFixed(0), "spm", lv,
+      `${base}<br><span style="color:var(--muted);">via ${m.cadSource} · estimates: ${est.join(" · ")} spm.${agree}</span>`);
+  }
 
   lv = m.shankAvg > C.shank.flag ? "red" : m.shankAvg > C.shank.flag*0.7 ? "amber" : "green";
   html += metricCard("Shank angle at footstrike", m.shankAvg.toFixed(1), "°", lv,
