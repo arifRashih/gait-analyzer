@@ -77,6 +77,27 @@
   <canvas id="overlay"></canvas>
 </div>
 
+<div class="card" id="validateCard" style="display:none; margin-top:-6px;">
+  <div style="font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:8px;">Footstrike detection — mark true contacts</div>
+  <div class="row" style="margin-bottom:8px;">
+    <button id="frmBack">◀ frame</button>
+    <input type="range" id="scrub" min="0" max="100" value="0" step="0.001" style="flex:1;min-width:180px;accent-color:var(--accent);">
+    <button id="frmFwd">frame ▶</button>
+    <span id="scrubTime" style="font-size:.85rem;color:var(--muted);">t = 0.00s</span>
+  </div>
+  <div class="row" style="margin-bottom:8px;">
+    <button class="primary" id="markBtn">● Mark footstrike</button>
+    <button id="compareBtn">Compare with detected</button>
+    <button id="clearMarks">Clear</button>
+  </div>
+  <div class="protocol" style="margin-bottom:8px;">
+    Scrub to each moment a foot actually plants and press <strong>Mark</strong> — do 6–12 across the clip — then <strong>Compare</strong>.
+    This measures how far the detector's timing is from ground truth, the check the contact metrics depend on.
+  </div>
+  <div id="markList" style="font-size:.8rem;color:var(--muted);margin-bottom:8px;">No marks yet.</div>
+  <div id="validateResult" style="font-size:.9rem;line-height:1.5;"></div>
+</div>
+
 <div class="metrics" id="metrics"></div>
 
 <div class="card" id="commentCard" style="display:none;">
@@ -89,27 +110,6 @@
     <summary>Per-footstrike detail</summary>
     <table id="strikeTable"></table>
   </details>
-</div>
-
-<div class="card" id="validateCard" style="display:none;">
-  <div style="font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:8px;">Validation — mark true footstrikes</div>
-  <div class="protocol" style="margin-bottom:10px;">
-    Scrub to each moment a foot actually plants and press <strong>Mark</strong> — do 6–12 across the clip — then <strong>Compare</strong>.
-    This measures how far the detector's timing is from ground truth, the check the contact metrics depend on.
-  </div>
-  <div class="row" style="margin-bottom:8px;">
-    <button id="frmBack">◀ frame</button>
-    <input type="range" id="scrub" min="0" max="100" value="0" step="0.001" style="flex:1;min-width:180px;accent-color:var(--accent);">
-    <button id="frmFwd">frame ▶</button>
-  </div>
-  <div class="row" style="margin-bottom:8px;">
-    <button class="primary" id="markBtn">● Mark footstrike</button>
-    <button id="compareBtn">Compare with detected</button>
-    <button id="clearMarks">Clear</button>
-    <span id="scrubTime" style="font-size:.85rem;color:var(--muted);">t = 0.00s</span>
-  </div>
-  <div id="markList" style="font-size:.8rem;color:var(--muted);margin-bottom:8px;">No marks yet.</div>
-  <div id="validateResult" style="font-size:.9rem;line-height:1.5;"></div>
 </div>
 
 <div class="card" style="text-align:center; font-size:.9rem;">
@@ -442,8 +442,8 @@ function finish() {
   // count — so missed footfalls and far-leg occlusion cannot bias it.
   const nearAnkId = nearSide === "L" ? LM.L_ANK : LM.R_ANK;
   const ankYser = frames.map(f => f.lms[nearAnkId].y * canvas.height);
-  const ankAC = autocorrPeriod(times, ankYser, 0.50, 1.10);   // stride-period band
-  const hipAC = autocorrPeriod(times, hipMidY, 0.28, 0.55);   // step-period band
+  const ankAC = autocorrPeriod(times, ankYser, 0.50, 1.10);
+  const hipAC = autocorrPeriod(times, hipMidY, 0.28, 0.55);
   const cadAnkle = ankAC ? 120 / ankAC.periodSec : NaN;
   const cadHip   = hipAC ?  60 / hipAC.periodSec : NaN;
   const cadEvent = nearStrikes.length >= 3
