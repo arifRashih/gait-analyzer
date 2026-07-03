@@ -91,6 +91,27 @@
   </details>
 </div>
 
+<div class="card" id="validateCard" style="display:none;">
+  <div style="font-size:.75rem;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:8px;">Validation — mark true footstrikes</div>
+  <div class="protocol" style="margin-bottom:10px;">
+    Scrub to each moment a foot actually plants and press <strong>Mark</strong> — do 6–12 across the clip — then <strong>Compare</strong>.
+    This measures how far the detector's timing is from ground truth, the check the contact metrics depend on.
+  </div>
+  <div class="row" style="margin-bottom:8px;">
+    <button id="frmBack">◀ frame</button>
+    <input type="range" id="scrub" min="0" max="100" value="0" step="0.001" style="flex:1;min-width:180px;accent-color:var(--accent);">
+    <button id="frmFwd">frame ▶</button>
+  </div>
+  <div class="row" style="margin-bottom:8px;">
+    <button class="primary" id="markBtn">● Mark footstrike</button>
+    <button id="compareBtn">Compare with detected</button>
+    <button id="clearMarks">Clear</button>
+    <span id="scrubTime" style="font-size:.85rem;color:var(--muted);">t = 0.00s</span>
+  </div>
+  <div id="markList" style="font-size:.8rem;color:var(--muted);margin-bottom:8px;">No marks yet.</div>
+  <div id="validateResult" style="font-size:.9rem;line-height:1.5;"></div>
+</div>
+
 <div class="card" style="text-align:center; font-size:.9rem;">
   Found this useful? Follow me on Instagram —
   <a href="https://www.instagram.com/arifrashih" target="_blank" rel="noopener"
@@ -126,6 +147,7 @@ const LM = { NOSE:0, L_SHO:11, R_SHO:12, L_HIP:23, R_HIP:24, L_KNEE:25, R_KNEE:2
 const $ = id => document.getElementById(id);
 const video = $("video"), canvas = $("overlay"), ctx = canvas.getContext("2d");
 let landmarker = null, frames = [], fileURL = null, framesSeen = 0, lastDetectError = null;
+let clipFps = 30, lastRun = null, manualMarks = [];
 
 if (!("requestVideoFrameCallback" in HTMLVideoElement.prototype)) {
   $("status") && ($("status").textContent = "This browser doesn't support frame-by-frame video processing. Use Chrome, Edge, or Safari.");
@@ -170,14 +192,13 @@ async function getLandmarker(variant) {
 
 function seekTo(t) {
   return new Promise(resolve => {
-    if (Math.abs(video.currentTime - t) < 1e-4) { resolve(); return; } // no seeked event if unchanged
+    if (Math.abs(video.currentTime - t) < 1e-4) { resolve(); return; }
     const onSeeked = () => { video.removeEventListener("seeked", onSeeked); resolve(); };
     video.addEventListener("seeked", onSeeked);
     video.currentTime = t;
   });
 }
 
-// Measure native frame rate with a short playback probe (no detection here).
 function probeFps() {
   return new Promise(resolve => {
     let count = 0, firstT = null, lastT = null;
@@ -222,6 +243,7 @@ $("analyzeBtn").addEventListener("click", async () => {
 
   $("status").textContent = "Measuring frame rate…";
   const fps = await probeFps();
+  clipFps = fps;
   const step = 1 / fps;
 
   $("status").textContent = `Processing every frame at ${fps} fps (frame-stepped — takes longer than the clip, but exact)…`;
@@ -277,9 +299,6 @@ function smooth(arr, w=5) {
   return out;
 }
 
-/* Resample an irregular (t,val) series onto a uniform grid via linear interp.
-   Frame-stepping samples uniformly, but detection dropouts can leave gaps; this
-   keeps autocorrelation well-defined regardless. */
 function resampleUniform(times, vals) {
   const n = times.length;
   const span = times[n-1] - times[0];
@@ -298,15 +317,14 @@ function resampleUniform(times, vals) {
 }
 
 /* Fundamental period of a near-periodic signal via normalised autocorrelation,
-   searched only within [minPeriodSec, maxPeriodSec]. Detrended first (subtract a
-   long moving average) to strip slow camera/treadmill drift while preserving the
-   gait band. Returns { periodSec, strength } or null; strength is the normalised
-   AC peak height in [0,1] — a rough confidence. */
+   searched within [minPeriodSec, maxPeriodSec]. Detrended (subtract a long
+   moving average) to strip slow drift while preserving the gait band. Returns
+   { periodSec, strength } or null; strength is the AC peak height in [0,1]. */
 function autocorrPeriod(times, vals, minPeriodSec, maxPeriodSec) {
   if (times.length < 8) return null;
   const { grid, dt } = resampleUniform(times, vals);
   const n = grid.length;
-  const hw = Math.max(3, Math.round(0.8 / dt));   // ~1.6s window: slower than any gait period
+  const hw = Math.max(3, Math.round(0.8 / dt));
   const base = smooth(grid, hw);
   const y = grid.map((v,i) => v - base[i]);
   let r0 = 0; for (let i=0;i<n;i++) r0 += y[i]*y[i];
@@ -323,7 +341,7 @@ function autocorrPeriod(times, vals, minPeriodSec, maxPeriodSec) {
     if (r[lag] > best.val) best = { lag, val: r[lag] };
   }
   if (best.lag < 0) return null;
-  let refined = best.lag;                         // parabolic interp for sub-frame period
+  let refined = best.lag;
   const rm = r[best.lag-1], rc = r[best.lag], rp = r[best.lag+1];
   if (rm !== undefined && rp !== undefined) {
     const denom = rm - 2*rc + rp;
@@ -375,17 +393,22 @@ function finish() {
   const hipMidY = frames.map(f => (f.lms[LM.L_HIP].y + f.lms[LM.R_HIP].y)/2 * canvas.height);
   const times = frames.map(f => f.t);
 
-  // footstrike detection: peaks of forward ankle displacement relative to hip
+  // footstrike detection: foot at its lowest point (ankle-y local maximum ~ the
+  // instant vertical velocity crosses zero on the way down) — a physically
+  // grounded proxy for initial contact. The old forward-displacement peak lagged
+  // contact and mis-timed the shank angle; this targets the plant itself.
   function strikesFor(ankleId, kneeId) {
-    const fwd = smooth(frames.map((f,i) => (f.lms[ankleId].x*canvas.width - hipMidX[i]) * dir / legLen), 2);
-    const ankY = smooth(frames.map(f => f.lms[ankleId].y * canvas.height), 2);
-    const yThresh = [...ankY].sort((a,b)=>a-b)[Math.floor(ankY.length*0.55)]; // near-ground check
+    const H = canvas.height;
+    const ankY = smooth(frames.map(f => f.lms[ankleId].y * H), 2);        // larger y = lower on screen
+    const fwd  = smooth(frames.map((f,i) => (f.lms[ankleId].x*canvas.width - hipMidX[i]) * dir / legLen), 2);
+    const sorted = [...ankY].sort((a,b)=>a-b);
+    const yThresh = sorted[Math.floor(sorted.length*0.55)];               // contact is in the lower part of the range
     const events = [];
-    for (let i=2; i<fwd.length-2; i++) {
-      if (fwd[i] >= fwd[i-1] && fwd[i] >= fwd[i+1] && fwd[i] > fwd[i-2] && fwd[i] > fwd[i+2]) {
-        if (ankY[i] < yThresh) continue; // ankle high = swing, not a strike
+    for (let i=2; i<ankY.length-2; i++) {
+      if (ankY[i] >= ankY[i-1] && ankY[i] >= ankY[i+1] && ankY[i] > ankY[i-2] && ankY[i] > ankY[i+2]) {
+        if (ankY[i] < yThresh) continue;                                  // foot high = swing, not a strike
         if (events.length && times[i] - events[events.length-1].t < CONFIG.minStrikeGapSec) {
-          if (fwd[i] > events[events.length-1].fwd) events[events.length-1] = mk(i);
+          if (ankY[i] > events[events.length-1].lowY) events[events.length-1] = mk(i);
           continue;
         }
         events.push(mk(i));
@@ -395,7 +418,7 @@ function finish() {
         const knee = px(f.lms[kneeId]), ank = px(f.lms[ankleId]);
         // shank angle vs vertical, positive = ankle ahead of knee (overstride direction)
         const shank = Math.atan2((ank.x-knee.x)*dir, ank.y-knee.y) * 180/Math.PI;
-        return { i, t: times[i], fwd: fwd[i], shank };
+        return { i, t: times[i], fwd: fwd[i], shank, lowY: ankY[i] };
       }
     }
     return events;
@@ -411,21 +434,18 @@ function finish() {
   }
 
   // metrics
-  // near side (better-tracked leg) by landmark visibility — used for the
-  // frequency estimate and the event-count cross-check
   const sideVis = (hip,knee,ank) => mean(frames.map(f => (f.lms[hip].v + f.lms[knee].v + f.lms[ank].v)/3));
   const nearSide = sideVis(LM.L_HIP,LM.L_KNEE,LM.L_ANK) >= sideVis(LM.R_HIP,LM.R_KNEE,LM.R_ANK) ? "L" : "R";
   const nearStrikes = nearSide === "L" ? L : R;
 
   // PRIMARY cadence = frequency of the gait rhythm (autocorrelation), NOT a strike
-  // count — so missed footfalls and far-leg occlusion cannot bias it. Near-ankle
-  // vertical cycles once per STRIDE; hip-mid vertical once per STEP.
+  // count — so missed footfalls and far-leg occlusion cannot bias it.
   const nearAnkId = nearSide === "L" ? LM.L_ANK : LM.R_ANK;
   const ankYser = frames.map(f => f.lms[nearAnkId].y * canvas.height);
   const ankAC = autocorrPeriod(times, ankYser, 0.50, 1.10);   // stride-period band
   const hipAC = autocorrPeriod(times, hipMidY, 0.28, 0.55);   // step-period band
-  const cadAnkle = ankAC ? 120 / ankAC.periodSec : NaN;       // (1/stride)*2*60
-  const cadHip   = hipAC ?  60 / hipAC.periodSec : NaN;       // (1/step)*60
+  const cadAnkle = ankAC ? 120 / ankAC.periodSec : NaN;
+  const cadHip   = hipAC ?  60 / hipAC.periodSec : NaN;
   const cadEvent = nearStrikes.length >= 3
     ? (nearStrikes.length / duration) * 60 * 2
     : (all.length / duration) * 60;
@@ -435,7 +455,6 @@ function finish() {
   else if (!isNaN(cadHip) && hipAC.strength > 0.20)   { cadence = cadHip;   cadSource = "hip rhythm"; }
   else                                                { cadence = cadEvent; cadSource = "strike count"; }
 
-  // cross-method agreement → confidence, and a direct read on missed strikes
   const cadEst = [cadAnkle, cadHip, cadEvent].filter(v => !isNaN(v) && v > 0);
   const cadSpread = cadEst.length > 1
     ? (Math.max(...cadEst) - Math.min(...cadEst)) / mean(cadEst) * 100 : NaN;
@@ -466,6 +485,8 @@ function finish() {
                   shankAvg, footAheadAvg, trunk, vosc, asym,
                   strikes: all, nL: L.length, nR: R.length });
   $("status").textContent = `Done — ${frames.length} frames, ${all.length} footstrikes over ${duration.toFixed(1)}s. Cadence via ${cadSource}.`;
+  lastRun = { fps: clipFps, duration, strikes: all };
+  setupValidation();
   $("analyzeBtn").disabled = false;
 }
 
@@ -599,6 +620,69 @@ function buildCommentary(m) {
   }
 
   return paras.map(p => `<p style="margin-bottom:10px;">${p}</p>`).join("");
+}
+
+/* ---------------- validation mode: ground-truth footstrike marking ---------------- */
+function setupValidation() {
+  if (!lastRun) return;
+  manualMarks = [];
+  const scrub = $("scrub");
+  scrub.min = 0; scrub.max = lastRun.duration.toFixed(3); scrub.step = (1/lastRun.fps).toFixed(4); scrub.value = 0;
+  ctx.clearRect(0,0,canvas.width,canvas.height);   // clean video for scrubbing; metrics stay in the cards
+  $("validateResult").innerHTML = "";
+  renderMarks();
+  $("validateCard").style.display = "block";
+}
+function renderMarks() {
+  $("markList").textContent = manualMarks.length
+    ? `Marks (${manualMarks.length}): ` + manualMarks.map(t=>t.toFixed(2)+"s").join(", ")
+    : "No marks yet.";
+}
+function vSeek(t) {
+  const dur = lastRun ? lastRun.duration : (video.duration||0);
+  t = Math.max(0, Math.min(dur, t));
+  video.currentTime = t;
+  $("scrub").value = t;
+  $("scrubTime").textContent = `t = ${t.toFixed(2)}s`;
+}
+/* match each manual mark to the nearest unused detected strike within tolerance;
+   report hits / misses / false-positives and the signed timing offset */
+function compareStrikes(manual, detected, tol) {
+  const det = detected.map(d=>d.t).slice().sort((a,b)=>a-b);
+  const man = manual.slice().sort((a,b)=>a-b);
+  const used = new Set();
+  const offs = [];
+  let hits = 0, misses = 0;
+  for (const mt of man) {
+    let bj = -1, bd = Infinity;
+    for (let j=0;j<det.length;j++){ if(used.has(j)) continue; const d=Math.abs(det[j]-mt); if(d<bd){bd=d;bj=j;} }
+    if (bj>=0 && bd<=tol){ used.add(bj); offs.push(det[bj]-mt); hits++; } else misses++;
+  }
+  const meanOff = offs.length ? offs.reduce((a,b)=>a+b,0)/offs.length : NaN;
+  const madOff  = offs.length ? offs.reduce((a,b)=>a+Math.abs(b),0)/offs.length : NaN;
+  return { hits, misses, falsePos: det.length - used.size, meanOff, madOff, nManual: man.length, nDet: det.length };
+}
+if ($("scrub")) {
+  $("scrub").addEventListener("input", e => vSeek(parseFloat(e.target.value)));
+  $("frmBack").addEventListener("click", () => vSeek(video.currentTime - 1/(lastRun?lastRun.fps:30)));
+  $("frmFwd").addEventListener("click", () => vSeek(video.currentTime + 1/(lastRun?lastRun.fps:30)));
+  $("markBtn").addEventListener("click", () => { manualMarks.push(video.currentTime); manualMarks.sort((a,b)=>a-b); renderMarks(); });
+  $("clearMarks").addEventListener("click", () => { manualMarks = []; renderMarks(); $("validateResult").innerHTML = ""; });
+  $("compareBtn").addEventListener("click", () => {
+    if (!lastRun || manualMarks.length < 3) { $("validateResult").innerHTML = `<span style="color:var(--amber);">Mark at least 3 footstrikes first.</span>`; return; }
+    const tol = Math.max(2/lastRun.fps, 0.08);
+    const r = compareStrikes(manualMarks, lastRun.strikes, tol);
+    const dirWord = r.meanOff >= 0 ? "after" : "before";
+    let html = `Marked <strong>${r.nManual}</strong> · detector matched <strong>${r.hits}</strong> `+
+      `(${(100*r.hits/r.nManual).toFixed(0)}%), missed <strong>${r.misses}</strong>, extra <strong>${r.falsePos}</strong> `+
+      `<span style="color:var(--muted);">(tolerance ±${(tol*1000).toFixed(0)} ms)</span>.`;
+    if (!isNaN(r.meanOff)) {
+      html += `<br>Timing offset: mean <strong>${r.meanOff*1000>=0?"+":""}${(r.meanOff*1000).toFixed(0)} ms</strong> `+
+        `(detector fires ${dirWord} your mark), mean absolute <strong>${(r.madOff*1000).toFixed(0)} ms</strong> ≈ ${(r.madOff*lastRun.fps).toFixed(1)} frames.`+
+        `<br><span style="color:var(--muted);font-size:.82rem;">A consistent late offset means shank angle is sampled after true contact — bias detection earlier to fix it. Misses or extras above ~10% mean the detector needs tuning before the contact metrics can be trusted.</span>`;
+    }
+    $("validateResult").innerHTML = html;
+  });
 }
 </script>
 </body>
